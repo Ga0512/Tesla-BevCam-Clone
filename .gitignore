@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Claude Code
+.claude/
+settings.local.json
+
+# Input videos and assets (too large for git — add your own)
+videos/*.mp4
+assets/
+
+# Output videos
+tesla_bev_fsd_clone.mp4
+tesla_map.mp4
+*.mp4
+
+# OSM tile cache (downloaded at runtime)
+tile_cache/
+
+# Model weights (downloaded automatically by ultralytics)
+*.pt
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
