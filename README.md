@@ -10,6 +10,14 @@ A Tesla FSD-style Bird's Eye View (BEV) visualization system built in Python. Re
 
 The BEV view auto-zooms based on speed (wider FOV at highway speeds, tighter in city) and shows full 360° coverage including rear-camera detections.
 
+## Data & Acknowledgements
+
+The 4-camera dashcam footage and synchronized telemetry powering this project were captured with a **[NATIX VX360](https://natix.network)** — a multi-camera capture device for vehicles (currently Tesla, more OEMs coming).
+
+NATIX is building the infrastructure layer for real-world AI perception data. Contributors install VX360 devices, capture multi-camera driving data, and earn $NATIX tokens for sharing it to a global, crowd-sourced network. The resulting dataset is used by autonomous driving teams, map makers, and AI labs training perception stacks and world models.
+
+Learn more at [natix.network](https://natix.network).
+
 ## Features
 
 - **360° BEV** — front, rear, left and right cameras all contribute detections to a single top-down canvas
