@@ -36,6 +36,7 @@ tile_cache/
 
 # Model weights (downloaded automatically by ultralytics)
 *.pt
+*.pth
 
 # OS
 .DS_Store

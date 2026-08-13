@@ -7,17 +7,21 @@ import time
 import urllib.request
 from collections import deque
 from ultralytics import YOLO
-from scipy.optimize import linear_sum_assignment
-
-# ─── CAMINHOS E ARQUIVOS ─────────────────────────────────
+from scipy.optimize import linear_sum_assignment# ─── CAMINHOS E ARQUIVOS ─────────────────────────────────
+# Only "front" is required. Set optional cameras to None to disable.
 VIDEOS = {
-    "front": "./videos/FRONT_2025-10-11_06-01-36.mp4",
-    "back":  "./videos/REAR_2025-10-11_06-01-36.mp4",
-    "left":  "./videos/LEFT_2025-10-11_06-01-36.mp4",
-    "right": "./videos/RIGHT_2025-10-11_06-01-36.mp4",
+    "front": "/mnt/c/Users/gabriel.cicotoste/HDSeagate/Projects/BevTesla/videos/rapidsave.com__-9iv42du4doih1.mp4",
+    "back":  None,
+    "left":  None,
+    "right": None,
 }
-TELEMETRY_CSV = "./videos/FRONT_2025-10-11_06-01-36.csv"
-OUT_VIDEO     = "tesla_bev_fsd_clone.mp4"
+TELEMETRY_CSV = None   # opcional: defina o caminho do CSV para ativar a telemetria
+DEPTH_MODEL   = "depth_anything_v2"   # None para desativar; "depth_anything_v2" = V2 Small (leve)
+DEPTH_MAX_M   = 100.0   # pixel mais distante (sem céu) considerado como 100 m
+DEPTH_OVERLAY = True    # mostra colormap de profundidade na view frontal
+UFLD_MODEL    = "ufldv2_tusimple_res18.pth"   # UFLDv2 (Tusimple) para detecção de faixa; None desativa
+UFLD_EMA      = 0.65    # fator de suavização temporal dos polinômios de faixa (0=nenhuma, 1=máx)
+OUT_VIDEO     = "tesla_bev_fsd_clone_9iv42du4doih1.mp4"
 OUT_MAP       = "tesla_map.mp4"
 
 FPS        = 30
@@ -50,7 +54,7 @@ TRAIL_COLORS = {
 # ─── FÍSICA DO MUNDO E CONSTANTES ────────────────────────
 LANE_WIDTH    = 4
 LANE_HALF     = LANE_WIDTH / 2
-MAX_DIST      = 80.0
+MAX_DIST      = 70.0
 REAR_DIST     = 20.0
 CAR_FRONT_TIP = 2.1
 
@@ -64,49 +68,52 @@ DIMS = {
 H_REAL = {k: v[1] for k, v in DIMS.items()}
 
 CAM_OFFSETS = {
-    "front": ( 0.0,  1.8),
-    "back":  ( 0.0, -2.0),
-    "left":  (-1.0,  0.5),
-    "right": ( 1.0,  0.5),
+    "front":      ( 0.0,  1.8),
+    "back":       ( 0.0, -2.0),
+    "left":       (-1.0,  0.5),
+    "right":      ( 1.0,  0.5),
+}
+CAM_YAW = {
+    "front":       0.0,
+    "back":        math.pi,
+    "left":        math.pi / 2,
+    "right":      -math.pi / 2,
 }
 
 # ─── PARÂMETROS DE CÂMERA PROJECT ────────────────────────
 FOCAL_DEPTH = 1250.0 / (1280 / CAM_W)
 FOCAL_HORIZ = 1150.0 / (1280 / CAM_W)
-CAM_HEIGHT  =  1.2
-FOCAL_VERT  = FOCAL_DEPTH
-FOCAL_REAR_HORIZ = FOCAL_HORIZ * 0.55
-FOCAL_REAR_VERT  = FOCAL_VERT * 0.55
-REAR_HORIZON_OFFSET = -35
+CAM_HEIGHT  = 1.2     # altura da câmera em relação ao chão (m)
 
 # ─── CÂMERA BEV DINÂMICA 360° ────────────────────────────
 #
 #  Para o BEV traseiro ser visível a câmera DEVE ficar em
 #  Y < -REAR_DIST (i.e. atrás do limite traseiro de detecção).
-#  cam_y é fixo em -32 m; apenas a altura (cam_z) varia com a
-#  velocidade para dar o zoom-out automático igual ao Tesla real.
+#  cam_y é fixo em -10 m (mais perto do ego → menos rua atrás);
+#  altura (cam_z) e mira (look_y) variam com a velocidade.
+#
+#  Câmera baixa e logo atrás do ego → vista de "chase cam":
+#  um pouco acima do carro, enxergando o carro ego inteiro.
+#  Mira longa (look_y) → carro desce no canvas (mais perto de
+#  nós) e o horizonte fica visível até ~100 m.
 #
 #  FOV 75° (vertical) — amplo o suficiente para frente e trás
 #  ficarem dentro do canvas sem distorção excessiva.
-#
-#  Posições verificadas analiticamente:
-#    Repouso  → cobre  ~40 m frente,  ~18 m atrás do ego
-#    130 km/h → cobre ~200 m frente,  ~15 m atrás do ego
 
-BEV_CAM_Y = -32.0                                        # fixo, atrás de REAR_DIST
+BEV_CAM_Y = -10.0                                        # fixo, atrás do ego
 FOV_BEV   = np.deg2rad(75)
 FOCAL_BEV = BEV_H / (2 * np.tan(FOV_BEV / 2))          # ≈ 469 px
 
 def v_norm(v): return v / (np.linalg.norm(v) + 1e-9)
 
 # Estado mutável da câmera BEV (atualizado a cada frame)
-_bev_pos          = np.array([0.0, BEV_CAM_Y, 20.0], float)
+_bev_pos          = np.array([0.0, BEV_CAM_Y, 14.0], float)
 _bev_fwd          = np.zeros(3, float)
 _bev_right        = np.zeros(3, float)
 _bev_up           = np.zeros(3, float)
 _bev_smooth_speed = 0.0
 
-def _rebuild_bev_basis(look_y=10.0):
+def _rebuild_bev_basis(look_y=26.0):
     global _bev_fwd, _bev_right, _bev_up
     cam_at     = np.array([0.0, look_y, 0.0], float)
     _bev_fwd   = v_norm(cam_at - _bev_pos)
@@ -118,12 +125,12 @@ def update_bev_camera(speed_mps):
     global _bev_pos, _bev_smooth_speed
     _bev_smooth_speed += 0.06 * (speed_mps - _bev_smooth_speed)   # τ ≈ 0.5 s
     t      = min(_bev_smooth_speed / 36.0, 1.0)                   # satura em 130 km/h
-    cam_z  = 20.0 + t * 30.0   # altura: 20 m → 50 m
-    look_y = 10.0 + t * 30.0   # mira:   10 m → 40 m à frente do ego
+    cam_z  = 14.0 + t * 8.0    # altura: 14 m → 22 m (mantém o carro em vista)
+    look_y = 26.0 + t * 10.0   # mira:   26 m → 36 m à frente do ego
     _bev_pos = np.array([0.0, BEV_CAM_Y, cam_z], float)
     _rebuild_bev_basis(look_y)
 
-_rebuild_bev_basis(10.0)   # inicializa com velocidade zero
+_rebuild_bev_basis(26.0)   # inicializa com velocidade zero
 
 def project_bev(P):
     d = P - _bev_pos
@@ -434,10 +441,14 @@ def draw_solid_3d_vehicle(img, center, dims, is_ego=False):
         cv2.fillPoly(img, [np.array([proj[i] for i in face_idx], np.int32)], color)
     cv2.polylines(img, [np.array([proj[4], proj[5], proj[6], proj[7]], np.int32)], True, top_color, 1, cv2.LINE_AA)
 
-def render_tesla_ui(tracked, ego_state, offset_y):
+def render_tesla_ui(tracked, ego_state, offset_y, lane_polys=None):
     bev = np.full((BEV_H, BEV_W, 3), BEV_BG, np.uint8)
-    draw_clean_lanes_animated(bev, offset_y)
-    draw_fsd_path_gradient(bev, offset_y)
+    if lane_polys:
+        draw_detected_lanes(bev, offset_y, lane_polys)
+        draw_fsd_path_gradient_real(bev, lane_polys)
+    else:
+        draw_clean_lanes_animated(bev, offset_y)
+        draw_fsd_path_gradient(bev, offset_y)
     for obj in tracked:
         if -30 < obj["ego_x"] < 30 and -REAR_DIST < obj["ego_y"] < MAX_DIST:
             draw_solid_3d_vehicle(bev, (obj["ego_x"], obj["ego_y"], 0), DIMS.get(obj["cls"], DIMS["car"]))
@@ -449,13 +460,40 @@ def render_tesla_ui(tracked, ego_state, offset_y):
     lat       = ego_state.get('lat', 0.0)
     lon       = ego_state.get('lon', 0.0)
 
+    # ── Contagem de objetos por classe ──
+    cls_counts = {}
+    for obj in tracked:
+        cls_counts[obj["cls"]] = cls_counts.get(obj["cls"], 0) + 1
+    counts_str = "  ".join(f"{k}:{v}" for k, v in sorted(cls_counts.items())) or "nenhum"
+
+    # ── Objeto mais próximo à frente (para ACC/TTC) ──
+    front_objs = [o for o in tracked if o["ego_y"] > CAR_FRONT_TIP]
+    closest = min(front_objs, key=lambda o: o["ego_y"]) if front_objs else None
+
     cv2.putText(bev, "PRND", (40, 50), cv2.FONT_HERSHEY_DUPLEX, 0.6, UI_ACCENT, 1, cv2.LINE_AA)
-    cv2.putText(bev, f"{speed_kph}", (BEV_W // 2 - 35, 60), cv2.FONT_HERSHEY_DUPLEX, 1.8, TEXT_COLOR, 2, cv2.LINE_AA)
-    cv2.putText(bev, "km/h", (BEV_W // 2 + 35, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, UI_ACCENT, 1, cv2.LINE_AA)
+    cv2.putText(bev, f"OBJ: {len(tracked)}  [{counts_str}]", (BEV_W // 2 - 160, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_COLOR, 1, cv2.LINE_AA)
+    if closest:
+        cv2.putText(bev, f"FRENTE: {closest['ego_y']:.1f} m", (BEV_W - 220, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, FSD_BLUE_CORE, 1, cv2.LINE_AA)
     bottom_y = BEV_H - 30
     cv2.putText(bev, f"HDG: {heading:05.1f} deg", (30, bottom_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_COLOR, 1, cv2.LINE_AA)
     cv2.putText(bev, f"ACC: {accel_x:+.2f} m/s^2", (200, bottom_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_COLOR, 1, cv2.LINE_AA)
     cv2.putText(bev, f"GPS: {lat:.5f}, {lon:.5f}", (BEV_W - 250, bottom_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_COLOR, 1, cv2.LINE_AA)
+    if lane_polys and (1 in lane_polys) and (2 in lane_polys):
+        x_l = _poly_x(lane_polys[1], 0.0); x_r = _poly_x(lane_polys[2], 0.0)
+        lane_offset = (x_l + x_r) / 2.0
+        lane_width  = x_r - x_l
+        # curvatura da pista no ponto 2m à frente (κ ≈ 2c / (1+b²)^1.5)
+        b = 0.5 * (lane_polys[1][1] + lane_polys[2][1])
+        c = 0.5 * (lane_polys[1][0] + lane_polys[2][0])
+        curv = abs(2.0 * c) / (1.0 + b * b) ** 1.5 if abs(b) > 1e-6 else abs(2.0 * c)
+        cv2.putText(bev, f"LANE: {lane_offset:+.2f} m", (30, bottom_y - 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, FSD_BLUE_CORE, 1, cv2.LINE_AA)
+        cv2.putText(bev, f"W: {lane_width:.2f} m", (200, bottom_y - 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, FSD_BLUE_CORE, 1, cv2.LINE_AA)
+        cv2.putText(bev, f"CURV: {curv:.4f} 1/m", (330, bottom_y - 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, FSD_BLUE_CORE, 1, cv2.LINE_AA)
     compass_x = BEV_W // 2
     compass_y = 85
     cv2.line(bev, (compass_x - 20, compass_y), (compass_x + 20, compass_y), UI_ACCENT, 1, cv2.LINE_AA)
@@ -465,23 +503,6 @@ def render_tesla_ui(tracked, ego_state, offset_y):
     return bev
 
 # ─── FUNÇÕES AUXILIARES ─────────────────────────────────
-def project_front_cam(wx, wy):
-    if wy < 0.5: return None
-    return int(CAM_W/2 + (wx*FOCAL_HORIZ)/wy), int(CAM_H/2 + (CAM_HEIGHT*FOCAL_VERT)/wy)
-
-def project_rear_cam(wx, wy):
-    if wy > -0.5: return None
-    return int(CAM_W/2 + (-wx*FOCAL_REAR_HORIZ)/-wy), int(CAM_H/2 + (CAM_HEIGHT*FOCAL_REAR_VERT)/-wy) + REAR_HORIZON_OFFSET
-
-def draw_cam_lanes_minimal(frame, is_front=True):
-    overlay = frame.copy()
-    y_range = np.linspace(3.0, 60, 40) if is_front else np.linspace(-2, -40, 30)
-    for side in (-LANE_HALF, LANE_HALF):
-        pts = [p for p in (project_front_cam(side, y) if is_front else project_rear_cam(side, y) for y in y_range) if p]
-        if len(pts) > 1: cv2.polylines(overlay, [np.array(pts)], False, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
-    return frame
-
 def load_telemetry(csv_path):
     data = []
     last_valid = {"speed_mps": 0.0, "accel_x": 0.0, "accel_y": 0.0,
@@ -515,14 +536,367 @@ def load_telemetry(csv_path):
     return data
 
 # ═══════════════════════════════════════════════════════════
+#  DEPTH ESTIMATION (Depth Anything V2 Small)
+# ═══════════════════════════════════════════════════════════
+
+_depth_model = None
+_depth_processor = None
+
+def _load_depth_model():
+    """Carrega Depth Anything V2 Small via transformers (GPU se disponível)."""
+    global _depth_model, _depth_processor
+    try:
+        import torch
+        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+        _depth_processor = AutoImageProcessor.from_pretrained("depth-anything/Depth-Anything-V2-Small-hf")
+        _depth_model = AutoModelForDepthEstimation.from_pretrained("depth-anything/Depth-Anything-V2-Small-hf")
+        if torch.cuda.is_available():
+            _depth_model.to("cuda")
+        _depth_model.eval()
+        print("  Depth: Depth Anything V2 Small ativo.")
+        return True
+    except Exception as e:
+        print(f"  Aviso: depth desativado ({e})")
+        _depth_model = None
+        return False
+
+def compute_depth_map(frame):
+    """Mapa de profundidade em metros, calibrado pela geometria do chão.
+
+    O depth relativo é convertido para metros ajustando uma escala única:
+    para pixels do chão abaixo do horizonte, a distância geométrica é
+    conhecida (flat-ground: dist = CAM_HEIGHT * FOCAL_DEPTH / (py - horizon)),
+    então escala = mediana(dist_geo * pred) nessa faixa. Isso ancora o
+    relativo na geometria da câmera, sem depender do horizonte (que era
+    o bug: tudo ficava esticado/afastado)."""
+    import torch
+    import numpy as np
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    inputs = _depth_processor(images=rgb, return_tensors="pt")
+    device = next(_depth_model.parameters()).device
+    with torch.no_grad():
+        pred = _depth_model(**inputs.to(device)).predicted_depth
+    pred = torch.nn.functional.interpolate(
+        pred.unsqueeze(1), size=(CAM_H, CAM_W),
+        mode="bicubic", align_corners=False).squeeze().cpu().numpy()
+    horizon_row = CAM_H // 2
+    rows = np.arange(horizon_row + 5, CAM_H)
+    dist_geo = CAM_HEIGHT * FOCAL_DEPTH / (rows - horizon_row)
+    ratios = dist_geo[:, None] * np.maximum(pred[rows, :], 1e-3)
+    scale = float(np.median(ratios))
+    return np.clip(scale / np.maximum(pred, 1e-3), 0.0, DEPTH_MAX_M * 1.5)
+
+# ═══════════════════════════════════════════════════════════
+#  LANE DETECTION (UFLDv2 — Tusimple ResNet18)
+# ═══════════════════════════════════════════════════════════
+#
+#  A entrada esperada é 3×320×800 (Tensor de 800 de largura).
+#  Preprocess: Resize para 400×800 + crop das 320 linhas inferiores.
+#  Saída: até 4 faixas, cada uma como lista de pontos (x, y) em
+#  pixels no espaço do frame de entrada.
+#
+#  Projeção flat-ground idêntica ao depth: para cada ponto da faixa,
+#      dist = CAM_HEIGHT * FOCAL_DEPTH / (py - horizon)
+#      ego_x = (px - CAM_W/2) * dist / FOCAL_DEPTH
+#      ego_y = dist
+#  Em seguida ajusta-se um polinômio x(y) por faixa, suavizado com
+#  EMA (UFLD_EMA) — igual ao que ADAS reais fazem antes de renderizar.
+
+_ufld_net    = None
+_ufld_anchors = {}
+_ufld_smoothed = {}   # {lane_idx: poly(x = a + b*y + c*y^2)}
+
+def _load_ufld_model():
+    """Carrega UFLDv2 (Tusimple ResNet18) se o peso existir."""
+    global _ufld_net, _ufld_anchors
+    try:
+        import torch
+        import torchvision
+        if not os.path.exists(UFLD_MODEL):
+            print(f"  UFLD: peso '{UFLD_MODEL}' ausente — lane desativado.")
+            return False
+
+        # ── parsingNet reproduzido standalone (arquitetura do repo) ──
+        num_grid_row, num_cls_row = 100, 56
+        num_grid_col, num_cls_col = 100, 41
+        num_lanes = 4
+        input_h, input_w = 320, 800
+        mlp_mid = 2048
+        input_dim = input_h // 32 * input_w // 32 * 8
+        dim1 = num_grid_row * num_cls_row * num_lanes
+        dim2 = num_grid_col * num_cls_col * num_lanes
+        dim3 = 2 * num_cls_row * num_lanes
+        dim4 = 2 * num_cls_col * num_lanes
+        total_dim = dim1 + dim2 + dim3 + dim4
+
+        res = torchvision.models.resnet18(pretrained=False)
+        layers = [res.conv1, res.bn1, res.relu, res.maxpool,
+                  res.layer1, res.layer2, res.layer3, res.layer4]
+
+        class UFLDBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1, self.bn1, self.relu, self.maxpool = layers[:4]
+                self.layer1, self.layer2, self.layer3, self.layer4 = layers[4:]
+            def forward(self, x):
+                x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+                x2 = self.layer1(x)
+                x3 = self.layer2(x2)
+                x4 = self.layer3(x3)
+                fea = self.layer4(x4)     # 512 canais → pool
+                return x2, x3, x4, fea
+
+        class UFLLaneNet(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = UFLDBackbone()
+                self.pool = torch.nn.Conv2d(512, 8, 1)
+                self.cls = torch.nn.Sequential(
+                    torch.nn.Identity(),          # cls.0 (fc_norm=False)
+                    torch.nn.Linear(input_dim, mlp_mid),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(mlp_mid, total_dim),
+                )
+            def forward(self, x):
+                x2, x3, x4, fea = self.backbone(x)
+                fea = self.pool(fea).view(-1, input_dim)
+                out = self.cls(fea)
+                return {
+                    "loc_row":   out[:, :dim1].view(-1, num_grid_row, num_cls_row, num_lanes),
+                    "loc_col":   out[:, dim1:dim1+dim2].view(-1, num_grid_col, num_cls_col, num_lanes),
+                    "exist_row": out[:, dim1+dim2:dim1+dim2+dim3].view(-1, 2, num_cls_row, num_lanes),
+                    "exist_col": out[:, dim1+dim2+dim3:].view(-1, 2, num_cls_col, num_lanes),
+                }
+
+        net = UFLLaneNet()
+        sd = torch.load(UFLD_MODEL, map_location="cpu")["model"]
+        sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
+        # renomeia 'model.' → 'backbone.'
+        sd = {("backbone." + k[6:]) if k.startswith("model.") else k: v
+              for k, v in sd.items()}
+        net.load_state_dict(sd, strict=False)
+        if torch.cuda.is_available():
+            net.to("cuda")
+        net.eval()
+        _ufld_net = net
+        _ufld_anchors = {
+            "row": torch.linspace(160, 710, num_cls_row) / 720.0,
+            "col": torch.linspace(0, 1, num_cls_col),
+        }
+        _ufld_smoothed.clear()
+        print("  UFLD: UFLDv2 Tusimple ResNet18 ativo.")
+        return True
+    except Exception as e:
+        print(f"  Aviso: UFLD desativado ({e})")
+        _ufld_net = None
+        return False
+
+def _ufld_preprocess(frame):
+    import torch
+    import torchvision
+    from PIL import Image
+    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    t = torchvision.transforms.Compose([
+        torchvision.transforms.Resize((400, 800)),
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize((0.485, 0.456, 0.406),
+                                         (0.229, 0.224, 0.225)),
+    ])
+    img = t(img)[:, -320:, :].unsqueeze(0)
+    return img
+
+def _ufld_pixels(pred):
+    """Decodifica a saída da rede em pontos (x, y) por faixa, no espaço
+    do frame (640×360). Faixas 1/2 = margens da pista do ego (row anchors),
+    faixas 0/3 = faixas externas (col anchors)."""
+    import torch
+    lr = pred["loc_row"][0]; lc = pred["loc_col"][0]
+    er = pred["exist_row"][0].argmax(0); ec = pred["exist_col"][0].argmax(0)
+    ngr, ncr, nlr = lr.shape
+    ngc, ncc, nlc = lc.shape
+    mir = lr.argmax(0); mic = lc.argmax(0)
+    row_anchor = _ufld_anchors["row"]
+    col_anchor = _ufld_anchors["col"]
+    lanes = {}
+
+    # Faixas detectadas via row anchors (1, 2): x varia, y fixo
+    for i in (1, 2):
+        pts = []
+        if er[:, i].sum() > ncr / 2:
+            for k in range(ncr):
+                if er[k, i]:
+                    a = torch.arange(max(0, mir[k, i] - 1),
+                                     min(ngr - 1, mir[k, i] + 1) + 1,
+                                     device=lr.device)
+                    x = (lr[a, k, i].softmax(0) * a.float()).sum().item() + 0.5
+                    x = x / (ngr - 1) * CAM_W
+                    y = float(row_anchor[k] * CAM_H)
+                    pts.append((int(x), int(y)))
+        lanes[i] = pts
+
+    # Faixas externas via col anchors (0, 3): y varia, x fixo
+    for i in (0, 3):
+        pts = []
+        if ec[:, i].sum() > ncc / 4:
+            for k in range(ncc):
+                if ec[k, i]:
+                    a = torch.arange(max(0, mic[k, i] - 1),
+                                     min(ngc - 1, mic[k, i] + 1) + 1,
+                                     device=lc.device)
+                    y = (lc[a, k, i].softmax(0) * a.float()).sum().item() + 0.5
+                    y = y / (ngc - 1) * CAM_H
+                    x = float(col_anchor[k] * CAM_W)
+                    pts.append((int(x), int(y)))
+        lanes[i] = pts
+    return lanes
+
+def detect_lanes(frame):
+    """Retorna {lane_idx: lista de (x, y) em pixels do frame}."""
+    global _ufld_net
+    if _ufld_net is None:
+        return {}
+    import torch
+    dev = next(_ufld_net.parameters()).device
+    x = _ufld_preprocess(frame).to(dev)
+    with torch.no_grad():
+        pred = _ufld_net(x)
+    return _ufld_pixels(pred)
+
+def _fit_lane_polys(lanes_px):
+    """Converte pontos de faixa para o frame do ego e ajusta um polinômio
+    x(y) = a + b*y + c*y^2 por faixa. Suaviza com EMA entre frames."""
+    import torch
+    horizon = CAM_H // 2
+    polys = {}
+    for idx, pts in lanes_px.items():
+        if len(pts) < 4:
+            continue
+        ego = []
+        for (px, py) in pts:
+            if py <= horizon:
+                continue
+            dist = CAM_HEIGHT * FOCAL_DEPTH / (py - horizon)
+            ex = (px - CAM_W / 2) * dist / FOCAL_DEPTH
+            if 0.5 < dist < MAX_DIST + 15:
+                ego.append((ex, dist))
+        if len(ego) < 4:
+            continue
+        ego = np.array(ego)
+        y_vals = ego[:, 1]; x_vals = ego[:, 0]
+        order = np.argsort(y_vals)
+        y_vals = y_vals[order]; x_vals = x_vals[order]
+        # polyfit x = f(y), grau 2 — curvas suaves
+        coeffs = np.polyfit(y_vals, x_vals, 2)
+        # EMA sobre os coeficientes
+        if idx in _ufld_smoothed:
+            coeffs = UFLD_EMA * _ufld_smoothed[idx] + (1 - UFLD_EMA) * coeffs
+        _ufld_smoothed[idx] = coeffs
+        polys[idx] = coeffs
+    # remove faixas que não apareceram neste frame
+    for idx in list(_ufld_smoothed):
+        if idx not in lanes_px:
+            del _ufld_smoothed[idx]
+    return polys
+
+def _poly_x(coeffs, y):
+    return coeffs[0] * y * y + coeffs[1] * y + coeffs[2]
+
+def draw_lanes_overlay_rgb(view, lanes_px, alpha=0.35):
+    """Overlay azul translúcido sobre a view RGB: preenche a pista do ego
+    (entre faixas 1 e 2) e desenha as linhas das faixas detectadas."""
+    overlay = view.copy()
+    lane_color = (255, 130, 30)     # azul translúcido (BGR)
+    if 1 in lanes_px and 2 in lanes_px and len(lanes_px[1]) > 4 and len(lanes_px[2]) > 4:
+        l1 = np.array(sorted(lanes_px[1], key=lambda p: p[1]), np.int32)
+        l2 = np.array(sorted(lanes_px[2], key=lambda p: p[1]), np.int32)
+        n = min(len(l1), len(l2))
+        if n > 4:
+            hull = np.vstack([l1[:n], l2[:n][::-1]])
+            cv2.fillPoly(overlay, [hull], lane_color)
+    for idx, pts in lanes_px.items():
+        if len(pts) < 2:
+            continue
+        ordered = np.array(sorted(pts, key=lambda p: p[1]), np.int32)
+        cv2.polylines(overlay, [ordered], False, lane_color, 3, cv2.LINE_AA)
+    return cv2.addWeighted(overlay, alpha, view, 1 - alpha, 0)
+
+def draw_detected_lanes(img, offset_y, lane_polys):
+    """Desenha as faixas detectadas no BEV: 1/2 tracejadas (pista do ego),
+    0/3 contínuas (externas). Substitui as lanes animadas falsas."""
+    dash_len = 3.0; gap_len = 5.0; cycle = dash_len + gap_len
+    shift = offset_y % cycle
+    y_pts = np.linspace(CAR_FRONT_TIP, MAX_DIST, 60)
+    for idx, coeffs in lane_polys.items():
+        pts = []
+        for y in y_pts:
+            p = project_bev(np.array([_poly_x(coeffs, y), y, 0.0]))
+            if p: pts.append(p)
+        if len(pts) < 2: continue
+        if idx in (0, 3):
+            cv2.polylines(img, [np.array(pts, np.int32)], False,
+                          (120, 120, 120), 3, cv2.LINE_AA)
+        else:
+            dash = (idx == 1)
+            side = 1 if idx == 2 else -1
+            cy = -shift
+            prev = None
+            for y in y_pts:
+                if cy >= CAR_FRONT_TIP:
+                    p = project_bev(np.array([_poly_x(coeffs, y), y, 0.0]))
+                    if p:
+                        if prev and y - prev[1] <= dash_len:
+                            cv2.line(img, prev[0], p, (120, 120, 120), 3, cv2.LINE_AA)
+                        prev = (p, y)
+                cy += cycle
+    return img
+
+def draw_fsd_path_gradient_real(img, lane_polys):
+    """Path azul (gradiente) seguindo o centro da pista detectada."""
+    if (1 not in lane_polys) or (2 not in lane_polys):
+        return draw_fsd_path_gradient(img, 0.0)
+    y_pts = np.linspace(CAR_FRONT_TIP, MAX_DIST, 50)
+    for i in range(len(y_pts) - 1):
+        y1, y2 = y_pts[i], y_pts[i+1]
+        progress = (y1 - CAR_FRONT_TIP) / (MAX_DIST - CAR_FRONT_TIP)
+        alpha = max(0.0, 1.0 - (progress ** 1.2))
+        color = (
+            int(BEV_BG[0] * (1 - alpha) + FSD_BLUE_CORE[0] * alpha),
+            int(BEV_BG[1] * (1 - alpha) + FSD_BLUE_CORE[1] * alpha),
+            int(BEV_BG[2] * (1 - alpha) + FSD_BLUE_CORE[2] * alpha)
+        )
+        x_l1 = _poly_x(lane_polys[1], y1); x_r1 = _poly_x(lane_polys[2], y1)
+        x_l2 = _poly_x(lane_polys[1], y2); x_r2 = _poly_x(lane_polys[2], y2)
+        pl1 = project_bev(np.array([x_l1 + 0.15, y1, 0.01]))
+        pr1 = project_bev(np.array([x_r1 - 0.15, y1, 0.01]))
+        pl2 = project_bev(np.array([x_l2 + 0.15, y2, 0.01]))
+        pr2 = project_bev(np.array([x_r2 - 0.15, y2, 0.01]))
+        if pl1 and pr1 and pl2 and pr2:
+            cv2.fillPoly(img, [np.array([pl1, pr1, pr2, pl2])], color)
+    return img
+
+# ═══════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════════
 
 def main():
+    if "front" not in VIDEOS:
+        raise ValueError("VIDEOS must contain at least a 'front' camera entry.")
+
     model          = YOLO("yolov8n.pt")
     tracker        = BEVByteTracker()
-    caps           = {k: cv2.VideoCapture(v) for k, v in VIDEOS.items()}
-    telemetry_data = load_telemetry(TELEMETRY_CSV)
+    caps           = {k: cv2.VideoCapture(v) for k, v in VIDEOS.items() if v is not None}
+
+    depth_active = False
+    if DEPTH_MODEL:
+        depth_active = _load_depth_model()
+
+    ufld_active = False
+    if UFLD_MODEL:
+        ufld_active = _load_ufld_model()
+
+    telemetry_data = []
+    if TELEMETRY_CSV and os.path.exists(TELEMETRY_CSV):
+        telemetry_data = load_telemetry(TELEMETRY_CSV)
 
     # ── Prepara mapa OSM ──────────────────────────────────
     gps_all = [(r["lat"], r["lon"]) for r in telemetry_data
@@ -538,13 +912,23 @@ def main():
     else:
         print("GPS insuficiente — mapa desativado.")
 
+    # ── Grid dinâmico de câmeras ───────────────────────────
+    cam_order = [k for k, v in VIDEOS.items() if v is not None]
+    n_cams = len(cam_order)
+    n_cols = n_cams if n_cams <= 3 else 3
+    n_rows = (n_cams + n_cols - 1) // n_cols
+    grid_w = n_cols * CAM_W
+    grid_h = n_rows * CAM_H
+    out_w = grid_w + BEV_W
+    out_h = max(grid_h, BEV_H)
+
     out = cv2.VideoWriter(OUT_VIDEO, cv2.VideoWriter_fourcc(*"mp4v"),
-                          FPS, (CAM_W * 2 + BEV_W, BEV_H))
+                          FPS, (out_w, out_h))
     print("Gerando UI FSD Clone Dinâmica com Telemetria e Movimento...")
 
     global_offset_y  = 0.0
-    gps_trail        = []                  # [(lat, lon)]  trajeto ego
-    veh_gps_trails   = {}                  # {id: deque[(lat, lon, cls)]}
+    gps_trail        = []
+    veh_gps_trails   = {}
 
     for frame_idx in range(MAX_FRAMES):
         frames, ok = {}, True
@@ -566,24 +950,59 @@ def main():
         global_dets = []
         cam_views   = {}
 
+        depth_map = None
+        if depth_active and "front" in frames:
+            depth_map = compute_depth_map(frames["front"])
+
+        lane_polys = {}
+        lanes_px = {}
+        if ufld_active and "front" in frames:
+            lanes_px = detect_lanes(frames["front"])
+            lane_polys = _fit_lane_polys(lanes_px)
+
         for cam, frame in frames.items():
             view = frame.copy()
+            yaw = CAM_YAW.get(cam, 0.0)
+            cos_t = math.cos(yaw)
+            sin_t = math.sin(yaw)
             for b in model(frame, conf=0.15, verbose=False)[0].boxes:
                 cls = model.names[int(b.cls[0])]
                 if cls not in DIMS: continue
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
+                # Filtra o capô do carro ego: aparece fixo na parte inferior
+                # central do frame frontal (região do hood), muito largo e
+                # baixo (w/h ~3-7) — o YOLO às vezes o classifica como veículo.
+                # Carros reais próximos têm w/h < 1.5, então não são afetados.
+                if cam == "front":
+                    w_bb, h_bb = x2 - x1, y2 - y1
+                    cx_b, cy_b = (x1 + x2) / 2, y2
+                    hood = (cy_b > CAM_H * 0.84
+                            and abs(cx_b - CAM_W / 2) < CAM_W * 0.22
+                            and w_bb / max(h_bb, 1) > 2.2)
+                    if hood:
+                        continue
                 dist = (H_REAL[cls] * FOCAL_DEPTH) / max(y2 - y1, 1)
-                lat  = (((x1+x2)/2 - CAM_W/2) * dist) / FOCAL_HORIZ
-                if cam == "front": ex, ey = lat,  dist
-                elif cam == "back": ex, ey = -lat, -dist
-                elif cam == "left": ex, ey = -dist, lat
-                else:               ex, ey =  dist, -lat
-                ox, oy = CAM_OFFSETS[cam]
+                if depth_map is not None and cam == "front":
+                    d = float(depth_map[min(y2, CAM_H - 1), int(min((x1 + x2) / 2, CAM_W - 1))])
+                    if d > 0:
+                        dist = d
+                # Mesma focal da lane (FOCAL_DEPTH): alinha o lateral do
+                # objeto com a geometria flat-ground usada nas faixas.
+                lat  = (((x1+x2)/2 - CAM_W/2) * dist) / FOCAL_DEPTH
+                ex = lat * cos_t - dist * sin_t
+                ey = lat * sin_t + dist * cos_t
+                ox, oy = CAM_OFFSETS.get(cam, (0.0, 0.0))
                 global_dets.append({"ego_x": ex+ox, "ego_y": ey+oy,
                                      "cls": cls, "conf": float(b.conf[0])})
                 cv2.rectangle(view, (x1, y1), (x2, y2), (200, 200, 200), 1)
-            cam_views[cam] = (draw_cam_lanes_minimal(view, cam == "front")
-                              if cam in ["front", "back"] else view)
+            cam_views[cam] = view
+            if ufld_active and cam == "front" and lanes_px:
+                cam_views[cam] = draw_lanes_overlay_rgb(cam_views[cam], lanes_px)
+            if DEPTH_OVERLAY and depth_map is not None and cam == "front":
+                depth_norm = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                cam_views[cam] = cv2.addWeighted(
+                    cam_views[cam], 0.7,
+                    cv2.applyColorMap(depth_norm, cv2.COLORMAP_TURBO), 0.3, 0)
 
         global_dets = _nms_ego(global_dets)
         tracked = tracker.update(global_dets)
@@ -612,10 +1031,24 @@ def main():
                 del veh_gps_trails[old_id]
 
         # ── BEV original ─────────────────────────────────
-        bev = render_tesla_ui(tracked, ego_state, global_offset_y)
-        grid = np.vstack([np.hstack([cam_views["front"], cam_views["right"]]),
-                          np.hstack([cam_views["left"],  cam_views["back"]])])
-        out.write(np.hstack([grid, bev]))
+        bev = render_tesla_ui(tracked, ego_state, global_offset_y, lane_polys)
+
+        # ── Grid dinâmico ────────────────────────────────
+        grid_rows = []
+        for r in range(n_rows):
+            row_cams = cam_order[r * n_cols : (r + 1) * n_cols]
+            row_frames = []
+            for c in row_cams:
+                row_frames.append(cam_views.get(c, np.zeros((CAM_H, CAM_W, 3), np.uint8)))
+            while len(row_frames) < n_cols:
+                row_frames.append(np.zeros((CAM_H, CAM_W, 3), np.uint8))
+            grid_rows.append(np.hstack(row_frames))
+        grid = np.vstack(grid_rows)
+        if grid.shape[0] < out_h:
+            pad = np.full((out_h - grid.shape[0], grid.shape[1], 3), 0, np.uint8)
+            grid = np.vstack([grid, pad])
+        canvas = np.hstack([grid, bev])
+        out.write(canvas)
 
         # ── Mapa OSM ─────────────────────────────────────
         if has_map and out_map and ego_lat != 0.0 and len(gps_trail) >= 2:
