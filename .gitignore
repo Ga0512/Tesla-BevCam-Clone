@@ -29,7 +29,6 @@ assets/
 # Output videos
 tesla_bev_fsd_clone.mp4
 tesla_map.mp4
-*.mp4
 
 # OSM tile cache (downloaded at runtime)
 tile_cache/
